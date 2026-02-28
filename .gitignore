@@ -1,0 +1,6 @@
+*.key
+*pcap
+*pcapng
+node_modules/
+.env
+pics/
