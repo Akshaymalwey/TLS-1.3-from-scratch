@@ -11,12 +11,50 @@ const serverCrt = fs.readFileSync('server.crt')
 const serverKey = fs.readFileSync('server.key')
 const caCert = fs.readFileSync('ca.crt')
 
+//function to send files
+function sendFileFromServer(filepath){
+
+    if(!activeSocket || !activeSocket.handshakeDone){
+        console.log("No secure client")
+        return
+    }
+
+    const filename = require('path').basename(filepath)
+    const stat = fs.statSync(filepath)
+
+    activeSocket.write(JSON.stringify({
+        type: "FileMeta",
+        filename: filename,
+        size: stat.size
+    }))
+
+    const stream = fs.createReadStream(filepath, { highWaterMark: 4096 })
+
+    stream.on("data",(chunk)=>{
+        const payload = encryptMessage(chunk, activeSocket.serverEncKey)
+
+        activeSocket.write(JSON.stringify({
+            type: "FileChunk",
+            data: payload
+        }))
+    })
+
+    stream.on("end",()=>{
+        activeSocket.write(JSON.stringify({
+            type: "FileEnd",
+            filename: filename
+        }))
+
+        console.log("File sent:", filename)
+    })
+}
+
 //function to encrypted the message
-function encryptMessage(plaintext, key) {
+function encryptMessage(data, key) {
     const iv = crypto.randomBytes(12); 
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     const encrypted = Buffer.concat([
-        cipher.update(plaintext, 'utf8'),
+        cipher.update(data),
         cipher.final()
     ]);
 
@@ -58,9 +96,10 @@ function decryptMessage(payload, key) {
         decipher.final()
     ]);
 
-    return decrypted.toString('utf8');
+    return decrypted;
 }
 
+let filestream = null
 //sending the server certificate if client connects
 const server = net.createServer((socket) => {
     activeSocket = socket
@@ -133,7 +172,7 @@ const server = net.createServer((socket) => {
 
         if(message.type === "EncryptedMessage"){
             try{
-                const plaintext = decryptMessage(message.data, socket.clientDecKey)
+                const plaintext = decryptMessage(message.data, socket.clientDecKey).toString()
                 console.log("Client Says:", plaintext)
 
                 if(plaintext == '/quit'){
@@ -141,8 +180,28 @@ const server = net.createServer((socket) => {
                     socket.destroy()
                 }
             }catch(e){
-                console.error("Decryption/auth Failed", e.message)
-                socket.destroy()
+                console.error("Decryption/auth Failed: ", e)
+            }
+        }
+
+        if(message.type === "FileMeta"){
+            console.log("Receiving File: ", message.filename)
+            filestream = fs.createWriteStream("received_" + message.filename)
+        }
+
+        if(message.type === "FileChunk"){
+            try{
+                const chunk = decryptMessage(message.data, socket.clientDecKey)
+                filestream.write(chunk)
+            }catch(e){
+                console.log("Chunk Decrypt Failed", e.message)
+            }
+        }
+
+        if(message.type === "FileEnd"){
+            if(filestream){
+                filestream.close()
+                console.log("File Received: ", message.filename)
             }
         }
     })
@@ -162,5 +221,10 @@ process.stdin.on('data', (chunk) => {
         if (activeSocket) activeSocket.end();
         process.exit(0);
     }
-  sendSecureFromServer(text);
+  if(text.startsWith("/file")){
+    const filepath = text.split(" ")[1]
+    sendFileFromServer(filepath)
+  }else{
+    sendSecureFromServer(text)
+}
 })

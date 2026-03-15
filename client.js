@@ -7,6 +7,43 @@ require('dotenv').config()
 
 const PORT = process.env.PORT
 
+//function sending file
+function sendFile(filepath){
+    if(!client.handshakeDone){
+        console.log("Handshake not done!")
+        return
+    }
+
+    const filename = require('path').basename(filepath)
+    const stats = fs.statSync(filepath)
+
+    //sending meta-data first
+    client.write(JSON.stringify({
+        type: "FileMeta",
+        filename: filename,
+        size: stats.size,
+    }) + "\n")
+
+    const stream = fs.createReadStream(filepath, {highWaterMark: 4096})
+
+    stream.on('data', (chunk) => {
+        const payload = encryptMessage(chunk, client.clientEncKey)
+        client.write(JSON.stringify({
+            type: "FileChunk",
+            data: payload
+        }) + "\n")
+    })
+
+    stream.on("end", () => {
+        client.write(JSON.stringify({
+            type: "FileEnd",
+            filename: filename
+        }) + "\n")
+    })
+
+    console.log("File Sent", filename)
+}
+
 //loading the certificates
 const clientCrt = fs.readFileSync('client.crt')
 const clientKey = fs.readFileSync('client.key')
@@ -44,11 +81,11 @@ function deriveSessionKeys(sharedSecret, clientRandom, serverRandom){
 }
 
 //function to encrypting the message
-function encryptMessage(plaintext, key){
+function encryptMessage(data, key){
     const iv = crypto.randomBytes(12)
     const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
     const encrypted = Buffer.concat([
-        cipher.update(plaintext, 'utf8'),
+        cipher.update(data),
         cipher.final()
     ])
     const authTag = cipher.getAuthTag();
@@ -72,8 +109,7 @@ function sendSecure(text){
     client.write(JSON.stringify({
         type: "EncryptedMessage",
         data: payload
-    }))
-
+    }) + "\n")
 }
 
 //function to decrypting the cipher
@@ -90,7 +126,7 @@ function decryptMessage(payload, key) {
         decipher.final()
     ]);
 
-    return decrypted.toString('utf8');
+    return decrypted;
 }
 
 //sending client random when establishing the connection
@@ -154,16 +190,40 @@ client.on('data', (data) => {
         client.write(JSON.stringify({ 
             type: "EncryptedMessage", 
             data: payload 
-        }));
+        }) + "\n");
     }
 
     if(message.type === "EncryptedMessage"){
         try{
-            const plaintext = decryptMessage(message.data, client.serverDecKey)
+            const plaintext = decryptMessage(message.data, client.serverDecKey).toString()
             console.log("Server Says:", plaintext)
+
         }catch(e){
             console.error("Decryption/auth Failed", e.message)
             client.destroy()
+        }
+    }
+
+    let filestream = null
+    if(message.type === "FileMeta"){
+        console.log("Receiving File: ", message.filename)
+        filestream = fs.createWriteStream("received_" + message.filename)
+    }
+
+    if(message.type === "FileChunk"){
+        try{
+            const decrypted = decryptMessage(message.data, client.serverDecKey)
+            const buffer = Buffer.from(decrypted)
+            filestream.write(buffer)
+        }catch(e){
+            console.log("Chunk Decrypt Failed")
+        }
+    }
+
+    if(message.type === "FileEnd"){
+        if(filestream){
+            filestream.close()
+            console.log("File Received: ", message.filename)
         }
     }
 })
@@ -180,5 +240,10 @@ process.stdin.on('data', (chunk) => {
         process.exit(0)
     }
 
-    sendSecure(text)
+    if(text.startsWith("/file")){
+        const filepath = text.split(" ")[1]
+        sendFile(filepath)
+    }else{
+        sendSecure(text)
+    }
 })
